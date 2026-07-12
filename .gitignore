@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Output directories
+output/
+**/output/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code - local settings only
+.claude/settings.local.json
