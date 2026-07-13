@@ -38,7 +38,35 @@ python 1_download.py vid t5oSxg5iG44 1080p --embed-subs  # 内嵌字幕
 > ⚠️ **内嵌字幕后，播放器默认只显示一条字幕轨道。**
 > 用 IINA / VLC 打开视频 → 右键 → 字幕 → 可切换到其他语言轨道。所有语言都在，只是需要手动切换。
 
-> 前提：Firefox 需登录 YouTube 账号
+### Cookie 与调试
+
+`1_download.py` 已默认带上 `--cookies-from-browser firefox`，会从本机 Firefox 读取 YouTube 登录态（无需手动指定 Cookie 路径）。
+
+**前提**：Firefox 已登录 YouTube 账号。
+
+若下载失败（如「请登录确认你不是机器人」、年龄限制等），可先用 yt-dlp 原生命令排查 Cookie 是否读取成功：
+
+```bash
+# 用 verbose 查看实际读取的 cookies.sqlite 路径
+yt-dlp --cookies-from-browser firefox --verbose "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+将 `VIDEO_ID` 换成实际视频 ID 或完整 URL。成功时日志中会出现类似：
+
+```
+Extracting cookies from firefox
+Extracting cookies from: "C:\Users\...\Mozilla\Firefox\Profiles\xxx.default\cookies.sqlite"
+Extracted N cookies from firefox
+```
+
+| 场景 | 做法 |
+|------|------|
+| 排查 Cookie 是否生效 | 加上 `--verbose`，确认上述日志出现 |
+| 仅列出格式、不下载 | 加 `-F` 或 `--list-subs --skip-download` |
+| 多个 Firefox 配置 | `--cookies-from-browser firefox:配置名` |
+| 不用 Firefox | 改用 `chrome` / `edge`，或 `--cookies cookies.txt` |
+
+**注意**：Firefox 运行时可能锁定 `cookies.sqlite`，读不到时可先关闭 Firefox 再试。
 
 ---
 
