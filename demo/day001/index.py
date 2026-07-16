@@ -4,3 +4,4 @@
 count = 10_000 + 123
 print(count)
 
+print(list(range(4, 2, -1)))
