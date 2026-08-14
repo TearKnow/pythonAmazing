@@ -1,11 +1,47 @@
 # YouTube 工具集
 
+## 推荐用法（不用记参数）
+
+```bash
+python allInOne.py            # 输入链接，跟着提示选即可
+python allInOne.py <URL>      # 或直接带链接
+```
+
 ## 运行顺序
 
 ```
-① 1_download.py  ──→  下载字幕 (SRT) 或 下载视频
+⓪ allInOne.py  ──→  交互式下载：输入链接 → 选字幕 → 选画质 → 下载（推荐）
+① 1_download.py  ──→  命令行版：下载字幕 (SRT) 或 下载视频
 ② 2_clean_srt.py  ──→  清理字幕去重
 ```
+
+---
+
+## ⓪ allInOne.py — 交互式下载（推荐）
+
+不用记任何参数，运行后一步步回答即可：
+
+1. 输入链接（单个视频或播放列表均可）
+2. 自动探测：是视频还是列表、有没有字幕、支持哪些画质
+3. 有字幕 → 选择如何处理字幕（内嵌到视频 / 单独 SRT / 视频+单独字幕文件 / 不下载）
+4. 选择画质与格式：`1080p · mp4`、`720p · webm` 等逐项列出（播放列表以第一个视频为参考）
+5. 播放列表可选限量（如 `1-5`、`1,3,7`，回车=全部）
+6. 确认配置后开始下载
+
+```bash
+python allInOne.py
+python allInOne.py "https://www.youtube.com/watch?v=xxx"
+python allInOne.py "https://www.youtube.com/playlist?list=xxx"
+```
+
+| 字幕选项 | 效果 |
+|------|------|
+| 不下载字幕 | 纯视频 |
+| 内嵌到视频 | 字幕烧进视频文件，播放器可切换轨道 |
+| 只下载字幕 SRT | 不下载视频，配合 2_clean_srt.py |
+| 视频 + 单独字幕文件 | 视频和 SRT 分开放，便于后续清理 |
+
+> 探测或下载时如果 Firefox cookie 失效，脚本会自动去掉 cookie 重试（公开内容无需登录）；字幕语言、画质、视频格式（mp4/webm）都可在流程中自由选择。**注意**：YouTube 上 2160p/1440p 通常只有 webm（VP9/AV1），mp4（H.264）一般最高 1080p，选“最佳 mp4”即可拿到 H.264 的 mp4。
 
 ---
 
@@ -67,6 +103,73 @@ Extracted N cookies from firefox
 | 不用 Firefox | 改用 `chrome` / `edge`，或 `--cookies cookies.txt` |
 
 **注意**：Firefox 运行时可能锁定 `cookies.sqlite`，读不到时可先关闭 Firefox 再试。
+
+---
+
+### 播放列表（Playlist）下载
+
+`1_download.py` 没专门做播放列表，但 yt-dlp 对带 `list=` 的 URL 会**默认下载整个列表**，直接传播放列表 URL 就行。两条规则：
+
+1. **URL 必须加引号**：`&` 会被 shell 拆掉，`list=` 后半截直接丢。
+2. **文件名加集数序号**：`%(playlist_index)03d` → `001_`、`002_`…，否则顺序乱。
+
+公开列表一般不用 cookie（Firefox cookie 失效时也别慌，去掉 `--cookies-from-browser firefox` 即可）。
+
+```bash
+# 只下字幕 (SRT)，不下载视频 —— 配合 2_clean_srt.py 用
+yt-dlp --js-runtimes node \
+  --write-auto-subs --write-subs \
+  --sub-langs "en,zh-Hans" --convert-subs srt \
+  --skip-download -f sb0 \
+  -o "output/%(playlist_title)s/%(playlist_index)03d_%(title)s [%(id)s].%(ext)s" \
+  "https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID"
+
+# 下视频（最佳画质 + 内嵌字幕）
+yt-dlp --js-runtimes node \
+  -f "bestvideo+bestaudio/best" \
+  --embed-subs --write-auto-subs --sub-langs "en,zh-Hans" \
+  -o "output/%(playlist_title)s/%(playlist_index)03d_%(title)s [%(id)s].%(ext)s" \
+  "https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID"
+
+# 先试跑 1~2 集，确认没问题再去掉 --playlist-items
+yt-dlp --js-runtimes node \
+  --write-auto-subs --write-subs \
+  --sub-langs "en,zh-Hans" --convert-subs srt \
+  --skip-download -f sb0 \
+  --playlist-items 1-2 \
+  -o "output/%(playlist_title)s/%(playlist_index)03d_%(title)s [%(id)s].%(ext)s" \
+  "https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID"
+```
+
+其他常用参数：`--playlist-start N` / `--playlist-end N` / `--playlist-items 3-5` 限量下载。
+
+### 控制画质 / 音频（替换下视频命令里的 `-f` 或加 `-x`）
+
+| 需求 | 写法 |
+|------|------|
+| 限制最高分辨率（如 720p） | `-f "bv*[height<=720]+ba/b[height<=720]"` |
+| 同上，更简写 | `-f "bestvideo+bestaudio/best" -S "res:720"` |
+| 只要音频，不转码（原始 m4a） | `-f "ba/b"` |
+| 音频转 MP3（最高音质 V0） | `-x --audio-format mp3 --audio-quality 0` |
+| 音频限码率（≤128k） | `-f "bv*[height<=720]+ba[abr<=128]/b[height<=720]"` |
+
+```bash
+# 例子：下 720p 封顶的视频（含内嵌字幕）
+yt-dlp --js-runtimes node \
+  -f "bv*[height<=720]+ba/b[height<=720]" \
+  --embed-subs --write-auto-subs --sub-langs "en,zh-Hans" \
+  -o "output/%(playlist_title)s/%(playlist_index)03d_%(title)s [%(id)s].%(ext)s" \
+  "https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID"
+
+# 例子：整个列表转 MP3 音频
+yt-dlp --js-runtimes node -x --audio-format mp3 --audio-quality 0 \
+  -o "output/%(playlist_title)s/%(playlist_index)03d_%(title)s.%(ext)s" \
+  "https://www.youtube.com/watch?v=VIDEO_ID&list=PLAYLIST_ID"
+```
+
+> 说明：`bv*[height<=720]` = 不高于 720p 的视频流，`ba` = 最佳音频流，`+` 表示合并；`/b` 是兜底（合并不了就单文件）。单视频下载同样适用这些写法。
+
+> ⚠️ 注意：输出路径相对于 `youtube/` 目录，在项目根目录跑时前面加 `youtube/`，如 `-o "youtube/output/..."`。
 
 ---
 
