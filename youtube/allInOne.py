@@ -25,6 +25,7 @@ YTDLP_OPTS = [
     "--cookies-from-browser", "firefox",
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
+    "--socket-timeout", "30",   # 网络挂起时 30 秒报错，不无限卡住
 ]
 # cookie 失效时降级用的最小选项（公开内容无需登录）
 NO_COOKIE_OPTS = [
@@ -153,6 +154,17 @@ def fmt_langs(langs):
     return f"{total} 种语言"
 
 
+def default_langs(sub_langs):
+    """自动选字幕语言：有 en 和 zh-Hans 就都带上，只有其一就只用它；
+    都没有则取检测到的前两种，再没有就回退 en,zh-Hans。"""
+    auto = [x for x in ("en", "zh-Hans") if x in sub_langs]
+    if auto:
+        return ",".join(auto)
+    if sub_langs:
+        return ",".join(sub_langs[:2])
+    return "en,zh-Hans"
+
+
 # ---------- 交互辅助 ----------
 
 def ask(prompt, default=None):
@@ -186,8 +198,20 @@ def ask_choice(prompt, options, default=0):
 
 # ---------- 菜单构造 ----------
 
+# 下载类型选项（第一步）
+MEDIA_OPTS = [
+    ("video", "视频"),
+    ("audio:mp3", "🎵 仅音频 · MP3（转码，通用）"),
+    ("audio:m4a", "🎵 仅音频 · M4A（原始，不转码）"),
+]
+AUDIO_DESC = {
+    "audio:mp3": "🎵 仅音频 · MP3（转码，通用）",
+    "audio:m4a": "🎵 仅音频 · M4A（原始，不转码）",
+}
+
+
 def build_sub_menu(has_subs):
-    """字幕处理选项"""
+    """字幕处理选项（仅视频模式使用）"""
     options = [
         ("none", "不下载字幕"),
         ("embed", "下载字幕并内嵌到视频里（推荐）"),
@@ -245,7 +269,7 @@ def run_ytdlp(*args):
     return subprocess.run(cmd).returncode
 
 
-def download(url, *, is_playlist, sub_mode, langs, quality, items):
+def download(url, *, is_playlist, sub_mode, langs, quality, media_type, items):
     """按所选配置拼 yt-dlp 参数并执行"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if is_playlist:
@@ -265,6 +289,12 @@ def download(url, *, is_playlist, sub_mode, langs, quality, items):
             "--sub-langs", langs, "--convert-subs", "srt",
             "--skip-download", "-f", "sb0",
         ]
+    elif media_type != "video":
+        if media_type == "audio:mp3":
+            args += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+        else:
+            # 只认 m4a，绝不 fallback 到 webm（没有 m4a 时 yt-dlp 会明确报错）
+            args += ["-f", "ba[ext=m4a]/b[ext=m4a]"]
     else:
         args += ["-f", quality]
         if sub_mode == "embed":
@@ -312,20 +342,36 @@ def main():
 
     has_subs = bool(p["sub_langs"])
 
-    # ---- 字幕选择 ----
+    # ---- ① 下载类型（视频 / 仅音频）----
     print("\n" + "-" * 54)
-    print("📝 字幕处理")
+    print("📦 下载类型")
     print("-" * 54)
-    if has_subs:
-        print(f"检测到可用字幕: {fmt_langs(p['sub_langs'])}")
-    sub_mode = ask_choice("请选择", build_sub_menu(has_subs), default=1 if has_subs else 0)
-    if sub_mode != "none" and has_subs:
-        langs = ask("字幕语言（默认 en,zh-Hans，多个用逗号分隔）: ", "en,zh-Hans")
-    else:
-        langs = "en,zh-Hans"
+    media_type = ask_choice("请选择", MEDIA_OPTS, default=0)
+    is_audio = media_type != "video"
 
-    # ---- 画质选择 ----
-    if sub_mode == "subs-only":
+    # ---- ② 字幕选择（仅视频模式；音频没有画面，不需要字幕）----
+    if is_audio:
+        sub_mode = "none"
+        langs = "en,zh-Hans"
+    else:
+        print("\n" + "-" * 54)
+        print("📝 字幕处理")
+        print("-" * 54)
+        if has_subs:
+            print(f"检测到可用字幕: {fmt_langs(p['sub_langs'])}")
+        sub_mode = ask_choice("请选择", build_sub_menu(has_subs), default=1 if has_subs else 0)
+        # 字幕语言自动按检测结果定，无需手动输入
+        if sub_mode != "none" and has_subs:
+            langs = default_langs(p["sub_langs"])
+            print(f"  → 字幕语言自动选为: {langs}")
+        else:
+            langs = "en,zh-Hans"
+
+    # ---- ③ 画质选择（仅视频）----
+    if is_audio:
+        quality = None
+        qual_desc = AUDIO_DESC[media_type]
+    elif sub_mode == "subs-only":
         quality, qual_desc = None, None
         print("\n（只下载字幕，无需选择画质）")
     else:
@@ -347,6 +393,8 @@ def main():
         "subs-only": f"只下载字幕 SRT（{langs}）",
         "separate": f"视频 + 单独字幕文件（{langs}）",
     }[sub_mode]
+    if is_audio:
+        sub_desc = "无（音频无字幕）"
     print("\n" + "=" * 54)
     print("📋 下载配置确认")
     print("=" * 54)
@@ -356,10 +404,14 @@ def main():
         print(f"  画质: {qual_desc}")
     if items:
         print(f"  范围: 第 {items} 集")
+    if is_audio:
+        print("  ℹ️ 说明: 会先下载最佳音频流（可能是 webm），"
+              "选 MP3 时自动转码并删除原 webm 文件")
     print(f"  输出: {OUTPUT_DIR}")
-    if ask("\n开始下载?（y=是 / 直接回车=取消）: ", "n").lower() in ("y", "yes"):
+    if ask("\n开始下载?（回车=是，输入 n=取消）: ", "y").strip().lower() not in ("n", "no", "0"):
         sys.exit(download(url, is_playlist=p["is_playlist"], sub_mode=sub_mode,
-                          langs=langs, quality=quality, items=items))
+                          langs=langs, quality=quality, media_type=media_type,
+                          items=items))
     else:
         print("👋 已取消，什么也没下载。")
 
