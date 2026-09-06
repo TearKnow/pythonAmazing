@@ -414,10 +414,22 @@ def download_book(url, *, is_playlist, langs, items, desc):
             return 1
 
         clean_mod = load_clean_srt_module()
-        written = []
+        written = []          # (txt_path, 行数)
+        bilingual = {}        # stem_key -> {zh: [...], en: [...], zh_code, en_code}
+        lang_codes = [c for c in langs.split(",") if c]
+
+        def _stem_lang(rel):
+            """'xx [id].zh-Hans.srt' → ('xx [id]', 'zh-Hans')；识别不出语言返回 (原名, None)"""
+            base = os.path.basename(rel)
+            name = base[:-4] if base.lower().endswith(".srt") else base
+            for code in lang_codes:
+                if name.endswith("." + code):
+                    return name[: -(len(code) + 1)], code
+            return name, None
+
         for srt_path in sorted(srt_files):
             rel = os.path.relpath(srt_path, tmp)          # 如 001_x [id].zh-Hans.srt
-            txt_rel = os.path.splitext(rel)[0] + ".txt"   # 同名前缀 .txt
+            txt_rel = os.path.splitext(rel)[0] + ".txt"   # 单语 txt，同名前缀 .txt
             txt_path = os.path.join(OUTPUT_DIR, txt_rel)
             os.makedirs(os.path.dirname(txt_path), exist_ok=True)
 
@@ -430,12 +442,61 @@ def download_book(url, *, is_playlist, langs, items, desc):
                 f.write("\n\n".join(lines) + "\n")
             written.append((txt_path, len(lines)))
 
+            # 为双语对照收集：同一 stem 的中/英清理后条目
+            stem, lang = _stem_lang(rel)
+            if not stem:
+                continue
+            key = os.path.join(os.path.dirname(rel), stem)
+            bucket = bilingual.setdefault(key, {"zh": None, "en": None})
+            if lang and (lang == "en" or lang.startswith("en")):
+                bucket["en"] = cleaned
+            elif lang and lang.startswith("zh"):
+                bucket["zh"] = cleaned
+
+        # 中英都有 → 生成“中英对照”文件：英文一行、中文一行、上下成组
+        def _ms(e, mod):
+            return mod.time_to_ms(e["start"])
+
+        for key, b in bilingual.items():
+            zh_all = b.get("zh") or []
+            en_all = b.get("en") or []
+            if not zh_all or not en_all:
+                continue
+            zh_sorted = sorted(zh_all, key=lambda e: _ms(e, clean_mod))
+            en_sorted = sorted(en_all, key=lambda e: _ms(e, clean_mod))
+            used = [False] * len(zh_sorted)
+            pairs = []  # (en_text, zh_text)
+            tol_ms = 5000
+            for e in en_sorted:
+                et = _ms(e, clean_mod)
+                best_i, best_d = None, None
+                for i, z in enumerate(zh_sorted):
+                    if used[i]:
+                        continue
+                    d = abs(_ms(z, clean_mod) - et)
+                    if best_i is None or d < best_d:
+                        best_i, best_d = i, d
+                if best_i is not None and best_d <= tol_ms:
+                    used[best_i] = True
+                    pairs.append((e["text"], zh_sorted[best_i]["text"]))
+                else:
+                    pairs.append((e["text"], ""))  # 这句没有对上中文
+
+            if pairs:
+                out_rel = os.path.join(key + ".中英对照.txt")
+                out_path = os.path.join(OUTPUT_DIR, out_rel)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for en_text, zh_text in pairs:
+                        f.write(en_text + "\n" + zh_text + "\n\n")
+                written.append((out_path, len(pairs)))
+
         print()
         for path, n in written:
             print(f"  ✅ {os.path.relpath(path, OUTPUT_DIR)}  （{n} 行）")
         if written:
             print(f"\n📚 已整理出 {len(written)} 个 txt 书稿，保存在: {OUTPUT_DIR}")
-            print("   （已去掉时间轴和重复帧，可直接当书读；原始 SRT 未保留）")
+            print("   （已去掉时间轴和重复帧；中英都有的视频会额外生成一份中英对照 txt）")
         else:
             print("\n⚠️ 字幕下载成功，但清理后为空。")
         return 0
