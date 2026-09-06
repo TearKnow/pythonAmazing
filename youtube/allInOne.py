@@ -7,17 +7,24 @@
 
 流程:
   1. 输入链接（单个视频或播放列表，也可直接作为参数传入）
-  2. 自动探测：是视频还是列表、有没有字幕、支持哪些画质
-  3. 有字幕 → 问你要不要字幕 / 怎么处理（内嵌 or 单独文件）
-  4. 列出可用画质 → 你选一个（列表则以第一个视频为参考）
-  5. 确认后开始下载
+  2. 自动探测：是视频还是列表、有没有中/英字幕、支持哪些画质
+  3. 选择要什么：视频 / 仅音频 / 📖 字幕当书看（不下载视频，
+     只下中英文字幕并整理成可读的 txt，像看书一样读）
+  4. 有字幕 → 问你要不要字幕 / 怎么处理（内嵌 or 单独文件）
+  5. 列出可用画质 → 你选一个（列表则以第一个视频为参考）
+  6. 确认后开始下载
+
+提示：只有中/英文会用于“字幕当书看”；若都没有，该选项会标明不可用。
 """
 
+import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
@@ -165,6 +172,37 @@ def default_langs(sub_langs):
     return "en,zh-Hans"
 
 
+# ---------- 中/英文字幕判定（字幕当书看专用）----------
+
+def zh_code_in(langs):
+    """中文代码：优先简体（zh-Hans/zh-CN），其次繁体（zh-Hant/zh-TW），再任意 zh*"""
+    for c in ("zh-Hans", "zh-CN", "zh-Hant", "zh-TW", "zh"):
+        if c in langs:
+            return c
+    return next((c for c in langs if c.startswith("zh")), None)
+
+
+def en_code_in(langs):
+    return "en" if "en" in langs else next((c for c in langs if c.startswith("en")), None)
+
+
+def zh_en_status(sub_langs):
+    """人类可读地说明中/英字幕情况，返回 (是否可用, 描述, 待下载语言CSV)。
+    只关心中文和英文：都有 → 都下；只有其一 → 下它并标明；都没有 → 不可用。"""
+    zh = zh_code_in(sub_langs)
+    en = en_code_in(sub_langs)
+    if zh and en:
+        return True, f"中英字幕都有（{zh} + {en}）", f"{zh},{en}"
+    if zh:
+        return True, f"仅中文字幕（{zh}），无英文", zh
+    if en:
+        return True, f"仅英文字幕（{en}），无中文", en
+    others = [c for c in sub_langs if c != "live_chat"]
+    if others:
+        return False, f"无中/英字幕（有其它 {len(others)} 种语言，帮不上“当书看”）", ""
+    return False, "无字幕", ""
+
+
 # ---------- 交互辅助 ----------
 
 def ask(prompt, default=None):
@@ -180,11 +218,15 @@ def ask(prompt, default=None):
 
 
 def ask_choice(prompt, options, default=0):
-    """数字选择。options 是 [(值, 描述), ...]。返回所选值。"""
+    """数字选择。options 是 [(值, 描述, 是否可选), ...]（第三项省略则默认可选）。
+    返回所选值；选到不可用项会提示并让重选。"""
     print()
-    for i, (_, desc) in enumerate(options):
+    for i, opt in enumerate(options):
+        desc = opt[1]
+        enabled = opt[2] if len(opt) > 2 else True
         mark = " (默认)" if i == default else ""
-        print(f"  {i}) {desc}{mark}")
+        tag = "" if enabled else "  ⚠️ 不可用"
+        print(f"  {i}) {desc}{tag}{mark}")
     while True:
         val = ask(prompt, default=str(default))
         try:
@@ -192,22 +234,42 @@ def ask_choice(prompt, options, default=0):
         except ValueError:  # 非数字（含 ² 这类 Unicode 数字）
             idx = -1
         if 0 <= idx < len(options):
-            return options[idx][0]
+            enabled = options[idx][2] if len(options[idx]) > 2 else True
+            if enabled:
+                return options[idx][0]
+            print("  ⚠️ 该选项当前不可用，请选择其它项。")
+            continue
         print(f"  ⚠️  请输入 0~{len(options) - 1} 之间的数字。")
 
 
 # ---------- 菜单构造 ----------
 
-# 下载类型选项（第一步）
-MEDIA_OPTS = [
-    ("video", "视频"),
-    ("audio:mp3", "🎵 仅音频 · MP3（转码，通用）"),
-    ("audio:m4a", "🎵 仅音频 · M4A（原始，不转码）"),
-]
 AUDIO_DESC = {
     "audio:mp3": "🎵 仅音频 · MP3（转码，通用）",
     "audio:m4a": "🎵 仅音频 · M4A（原始，不转码）",
 }
+
+
+def build_media_menu(sub_langs):
+    """下载类型选项（第一步）：视频 / 音频 / 📖 字幕当书看。
+    字幕当书看只关心中英文，因此按检测结果动态标注可用性。"""
+    ok, desc, _ = zh_en_status(sub_langs)
+    if ok:
+        if "都有" in desc:
+            book_desc = "📖 字幕当书看（中英文都有，整理成可读 txt，不下载视频）"
+        elif "仅中文" in desc:
+            book_desc = "📖 字幕当书看（仅中文，整理成可读 txt）"
+        else:
+            book_desc = "📖 字幕当书看（仅英文，整理成可读 txt）"
+    else:
+        book_desc = "📖 字幕当书看（无中/英字幕，不可用）"
+    options = [
+        ("video", "视频"),
+        ("audio:mp3", "🎵 仅音频 · MP3（转码，通用）"),
+        ("audio:m4a", "🎵 仅音频 · M4A（原始，不转码）"),
+        ("book", book_desc, ok),
+    ]
+    return options
 
 
 def build_sub_menu(has_subs):
@@ -308,6 +370,79 @@ def download(url, *, is_playlist, sub_mode, langs, quality, media_type, items):
     return run_ytdlp(*args)
 
 
+def load_clean_srt_module():
+    """加载同目录的 2_clean_srt.py（数字开头无法直接 import，故用文件方式加载）"""
+    path = os.path.join(SCRIPT_DIR, "2_clean_srt.py")
+    spec = importlib.util.spec_from_file_location("clean_srt", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def download_book(url, *, is_playlist, langs, items, desc):
+    """📖 字幕当书看：只下载中/英字幕，清理去重后整理成可读的 .txt。
+    输出：单视频 → output/标题 [id].语言.txt；播放列表 → output/列表/序号_标题 [id].语言.txt"""
+    print(f"\n📖 字幕当书看：只下载 {desc} 字幕，整理成可读 txt，不下载视频。")
+    tmp = tempfile.mkdtemp(prefix="subs_book_")
+    try:
+        if is_playlist:
+            out = os.path.join(
+                tmp,
+                "%(playlist_title)s/%(playlist_index)03d_%(title)s [%(id)s].%(ext)s")
+        else:
+            out = os.path.join(tmp, "%(title)s [%(id)s].%(ext)s")
+
+        args = [*YTDLP_OPTS, "-o", out,
+                "--write-auto-subs", "--write-subs",
+                "--sub-langs", langs, "--convert-subs", "srt",
+                "--skip-download", "-f", "sb0"]
+        if items:
+            args += ["--playlist-items", items]
+        args.append(url)
+        ret = run_ytdlp(*args)
+        if ret != 0:
+            return ret
+
+        # 找到刚下载的全部 srt
+        srt_files = []
+        for root, _, files in os.walk(tmp):
+            for fn in files:
+                if fn.lower().endswith(".srt"):
+                    srt_files.append(os.path.join(root, fn))
+        if not srt_files:
+            print("\n❌ 没有抓到任何字幕文件。可能该视频实际没有这些语言的字幕。")
+            return 1
+
+        clean_mod = load_clean_srt_module()
+        written = []
+        for srt_path in sorted(srt_files):
+            rel = os.path.relpath(srt_path, tmp)          # 如 001_x [id].zh-Hans.srt
+            txt_rel = os.path.splitext(rel)[0] + ".txt"   # 同名前缀 .txt
+            txt_path = os.path.join(OUTPUT_DIR, txt_rel)
+            os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+
+            entries = clean_mod.parse_srt(srt_path)
+            cleaned = clean_mod.clean_entries(entries)
+            lines = [e["text"].strip() for e in cleaned if e["text"].strip()]
+            if not lines:
+                continue
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("\n\n".join(lines) + "\n")
+            written.append((txt_path, len(lines)))
+
+        print()
+        for path, n in written:
+            print(f"  ✅ {os.path.relpath(path, OUTPUT_DIR)}  （{n} 行）")
+        if written:
+            print(f"\n📚 已整理出 {len(written)} 个 txt 书稿，保存在: {OUTPUT_DIR}")
+            print("   （已去掉时间轴和重复帧，可直接当书读；原始 SRT 未保留）")
+        else:
+            print("\n⚠️ 字幕下载成功，但清理后为空。")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------- 主流程 ----------
 
 def main():
@@ -337,22 +472,31 @@ def main():
         print(f"  第 1 个视频: {p['first_title'][:60]}")
     else:
         print(f"  标题: {p['first_title'][:60]}")
-    print(f"  字幕: {fmt_langs(p['sub_langs'])}")
+    _zh_en_ok, zh_en_desc, _langs_csv = zh_en_status(p["sub_langs"])
+    print(f"  字幕: {zh_en_desc}")
     print(f"  最高画质: {max(p['heights'])}p" if p["heights"] else "  最高画质: 未知")
 
     has_subs = bool(p["sub_langs"])
 
-    # ---- ① 下载类型（视频 / 仅音频）----
+    # ---- ① 下载类型（视频 / 仅音频 / 📖 字幕当书看）----
     print("\n" + "-" * 54)
     print("📦 下载类型")
     print("-" * 54)
-    media_type = ask_choice("请选择", MEDIA_OPTS, default=0)
-    is_audio = media_type != "video"
+    media_type = ask_choice("请选择", build_media_menu(p["sub_langs"]), default=0)
+    is_audio = media_type.startswith("audio")
+    is_book = media_type == "book"
 
-    # ---- ② 字幕选择（仅视频模式；音频没有画面，不需要字幕）----
-    if is_audio:
+    # ---- ② 字幕书 / 字幕处理 / 画质 ----
+    if is_book:
+        sub_mode = "book"
+        _ok, zh_en_desc, langs = zh_en_status(p["sub_langs"])
+        print(f"\n📖 字幕当书看 → 将下载字幕: {zh_en_desc}")
+        quality, qual_desc = None, None
+    elif is_audio:
         sub_mode = "none"
         langs = "en,zh-Hans"
+        quality = None
+        qual_desc = AUDIO_DESC[media_type]
     else:
         print("\n" + "-" * 54)
         print("📝 字幕处理")
@@ -367,32 +511,32 @@ def main():
         else:
             langs = "en,zh-Hans"
 
-    # ---- ③ 画质选择（仅视频）----
-    if is_audio:
-        quality = None
-        qual_desc = AUDIO_DESC[media_type]
-    elif sub_mode == "subs-only":
-        quality, qual_desc = None, None
-        print("\n（只下载字幕，无需选择画质）")
-    else:
-        print("\n" + "-" * 54)
-        print("📹 画质选择" + ("（以列表第一个视频为参考）" if p["is_playlist"] else ""))
-        print("-" * 54)
-        quality, qual_desc = pick_quality(p["fmt_opts"])
+        # ---- ③ 画质选择（仅视频；subs-only 不需要）----
+        if sub_mode == "subs-only":
+            quality, qual_desc = None, None
+            print("\n（只下载字幕，无需选择画质）")
+        else:
+            print("\n" + "-" * 54)
+            print("📹 画质选择" + ("（以列表第一个视频为参考）" if p["is_playlist"] else ""))
+            print("-" * 54)
+            quality, qual_desc = pick_quality(p["fmt_opts"])
 
     # ---- 列表限量 ----
     items = None
-    if p["is_playlist"] and sub_mode != "subs-only":
+    if p["is_playlist"] and sub_mode not in ("subs-only",):
         val = ask("\n播放列表下载范围，回车=全部；如 1-5 / 1,3,7: ")
         items = val or None
 
     # ---- 确认 ----
-    sub_desc = {
-        "none": "不下载字幕",
-        "embed": f"字幕内嵌到视频（{langs}）",
-        "subs-only": f"只下载字幕 SRT（{langs}）",
-        "separate": f"视频 + 单独字幕文件（{langs}）",
-    }[sub_mode]
+    if is_book:
+        sub_desc = f"📖 只下中/英字幕并整理成 txt（{langs}）"
+    else:
+        sub_desc = {
+            "none": "不下载字幕",
+            "embed": f"字幕内嵌到视频（{langs}）",
+            "subs-only": f"只下载字幕 SRT（{langs}）",
+            "separate": f"视频 + 单独字幕文件（{langs}）",
+        }[sub_mode]
     if is_audio:
         sub_desc = "无（音频无字幕）"
     print("\n" + "=" * 54)
@@ -409,6 +553,9 @@ def main():
               "选 MP3 时自动转码并删除原 webm 文件")
     print(f"  输出: {OUTPUT_DIR}")
     if ask("\n开始下载?（回车=是，输入 n=取消）: ", "y").strip().lower() not in ("n", "no", "0"):
+        if is_book:
+            sys.exit(download_book(url, is_playlist=p["is_playlist"],
+                                   langs=langs, items=items, desc=zh_en_desc))
         sys.exit(download(url, is_playlist=p["is_playlist"], sub_mode=sub_mode,
                           langs=langs, quality=quality, media_type=media_type,
                           items=items))
