@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-交互式 YouTube 下载器 — 不用记任何参数，跟着提示走。
+交互式下载器 — 不用记任何参数，跟着提示走。
 
 用法:
   python allInOne.py [URL]
 
-流程:
+模式:
+  1. YouTube：输入链接 → 探测 → 选类型/字幕/画质 → 下载
+  2. B 站文件批量：读 ID 文件 → 问一次配置 → 无 cookie 依次下载
+
+YouTube 流程:
   1. 输入链接（单个视频或播放列表，也可直接作为参数传入）
   2. 自动探测：是视频还是列表、有没有中/英字幕、支持哪些画质
   3. 选择要什么：视频 / 仅音频 / 📖 字幕当书看（不下载视频，
@@ -15,6 +19,7 @@
   6. 确认后开始下载
 
 提示：只有中/英文会用于“字幕当书看”；若都没有，该选项会标明不可用。
+B 站批量：文件可为 JSON 数组或一行一个 BV/av 号；失败跳过，最后汇总。
 """
 
 import importlib.util
@@ -34,14 +39,18 @@ YTDLP_OPTS = [
     "--remote-components", "ejs:github",
     "--socket-timeout", "30",   # 网络挂起时 30 秒报错，不无限卡住
 ]
-# cookie 失效时降级用的最小选项（公开内容无需登录）
+# cookie 失效时降级用的最小选项（公开内容 / B 站批量无需登录）
 NO_COOKIE_OPTS = [
     "--js-runtimes", "node",
     "--remote-components", "ejs:github",
+    "--socket-timeout", "30",
 ]
 
 # 常见分辨率档位，用于兜底展示（探测不到时用）
 FALLBACK_HEIGHTS = [2160, 1440, 1080, 720, 480, 360, 240, 144]
+DEFAULT_BILIBILI_FILE = os.path.join(SCRIPT_DIR, "bilibili.txt")
+# 从任意文本（含 JSON 数组）中抽取 B 站 ID
+_BILIBILI_ID_RE = re.compile(r"\b(BV[0-9A-Za-z]+|av\d+)\b", re.IGNORECASE)
 
 
 def normalize_url(input_str: str) -> str:
@@ -56,6 +65,40 @@ def normalize_url(input_str: str) -> str:
     if "youtube.com" in input_str or "youtu.be" in input_str:
         return f"https://{input_str}"
     return input_str
+
+
+def parse_bilibili_ids(text: str) -> list:
+    """从文本中按出现顺序抽取 BV/av 号，去重。兼容 JSON 数组与一行一个 ID。"""
+    seen = set()
+    ids = []
+    for m in _BILIBILI_ID_RE.finditer(text):
+        raw = m.group(1)
+        # 统一 BV 前缀大小写，av 保持小写前缀
+        if raw.upper().startswith("BV"):
+            vid = "BV" + raw[2:]
+        else:
+            vid = "av" + raw[2:] if raw.lower().startswith("av") else raw
+        key = vid.lower()
+        if key not in seen:
+            seen.add(key)
+            ids.append(vid)
+    return ids
+
+
+def load_bilibili_ids_from_file(path: str) -> list:
+    """读取文件并解析 B 站 ID；文件不存在或无 ID 时抛出 ValueError。"""
+    if not os.path.isfile(path):
+        raise ValueError(f"文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    ids = parse_bilibili_ids(text)
+    if not ids:
+        raise ValueError(f"文件中未找到任何 BV/av 号: {path}")
+    return ids
+
+
+def bilibili_url(vid: str) -> str:
+    return f"https://www.bilibili.com/video/{vid}"
 
 
 def run_capture(args):
@@ -272,6 +315,15 @@ def build_media_menu(sub_langs):
     return options
 
 
+def build_media_menu_batch():
+    """B 站批量：仅视频 / 音频（不含字幕当书看）。"""
+    return [
+        ("video", "视频"),
+        ("audio:mp3", "🎵 仅音频 · MP3（转码，通用）"),
+        ("audio:m4a", "🎵 仅音频 · M4A（原始，不转码）"),
+    ]
+
+
 def build_sub_menu(has_subs):
     """字幕处理选项（仅视频模式使用）"""
     options = [
@@ -290,12 +342,11 @@ def build_quality_menu(fmt_opts):
     fmt_opts: [(height, ext), ...]（已排序）或 []（探测失败，走兜底档位）"""
     options = [
         ("bestvideo+bestaudio/best", "最佳画质（自动选最高，可能是 webm）"),
-    ]
-    if any(ext == "mp4" for _, ext in fmt_opts):
-        options.append((
+        (
             "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
-            "最佳 mp4（H.264，最高 1080p）",
-        ))
+            "最佳 mp4（H.264，优先 mp4）",
+        ),
+    ]
     if fmt_opts:
         for h, ext in fmt_opts:
             if ext == "mp4":
@@ -331,8 +382,9 @@ def run_ytdlp(*args):
     return subprocess.run(cmd).returncode
 
 
-def download(url, *, is_playlist, sub_mode, langs, quality, media_type, items):
-    """按所选配置拼 yt-dlp 参数并执行"""
+def download(url, *, is_playlist, sub_mode, langs, quality, media_type, items,
+             ytdlp_opts=None):
+    """按所选配置拼 yt-dlp 参数并执行。ytdlp_opts 默认带 cookie；B 站批量可传 NO_COOKIE_OPTS。"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if is_playlist:
         out = os.path.join(
@@ -341,7 +393,8 @@ def download(url, *, is_playlist, sub_mode, langs, quality, media_type, items):
     else:
         out = os.path.join(OUTPUT_DIR, "%(title)s [%(id)s].%(ext)s")
 
-    args = [*YTDLP_OPTS, "-o", out]
+    base_opts = YTDLP_OPTS if ytdlp_opts is None else ytdlp_opts
+    args = [*base_opts, "-o", out]
     if items:
         args += ["--playlist-items", items]
 
@@ -504,13 +557,117 @@ def download_book(url, *, is_playlist, langs, items, desc):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ---------- B 站批量 ----------
+
+def run_bilibili_batch():
+    """从文件读 B 站 ID，问一次配置后无 cookie 依次下载。"""
+    print("\n" + "-" * 54)
+    print("📁 通过文件下载 B 站视频")
+    print("-" * 54)
+    hint = DEFAULT_BILIBILI_FILE
+    path = ask(f"\nID 文件路径（回车=默认 {hint}）: ", hint)
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+
+    try:
+        ids = load_bilibili_ids_from_file(path)
+    except ValueError as e:
+        print(f"\n❌ {e}")
+        sys.exit(1)
+
+    preview_n = min(5, len(ids))
+    print(f"\n✅ 解析到 {len(ids)} 个 ID（来自 {path}）")
+    print(f"  预览前 {preview_n} 个: {', '.join(ids[:preview_n])}")
+    if len(ids) > preview_n:
+        print(f"  … 以及另外 {len(ids) - preview_n} 个")
+
+    print("\n" + "-" * 54)
+    print("📦 下载类型（整批共用）")
+    print("-" * 54)
+    media_type = ask_choice("请选择", build_media_menu_batch(), default=0)
+    is_audio = media_type.startswith("audio")
+    langs = "en,zh-Hans"
+
+    if is_audio:
+        sub_mode = "none"
+        quality, qual_desc = None, AUDIO_DESC[media_type]
+    else:
+        print("\n" + "-" * 54)
+        print("📝 字幕处理（整批共用；不逐个探测）")
+        print("-" * 54)
+        sub_mode = ask_choice("请选择", build_sub_menu(True), default=0)
+        if sub_mode == "subs-only":
+            quality, qual_desc = None, None
+            print("\n（只下载字幕，无需选择画质）")
+        else:
+            print("\n" + "-" * 54)
+            print("📹 画质选择（整批共用）")
+            print("-" * 54)
+            quality, qual_desc = pick_quality([])
+
+    sub_desc = {
+        "none": "不下载字幕",
+        "embed": f"字幕内嵌到视频（{langs}）",
+        "subs-only": f"只下载字幕 SRT（{langs}）",
+        "separate": f"视频 + 单独字幕文件（{langs}）",
+    }[sub_mode]
+    if is_audio:
+        sub_desc = "无（音频无字幕）"
+
+    print("\n" + "=" * 54)
+    print("📋 B 站批量配置确认")
+    print("=" * 54)
+    print(f"  数量: {len(ids)} 个视频")
+    print(f"  文件: {path}")
+    print(f"  字幕: {sub_desc}")
+    if qual_desc:
+        print(f"  画质: {qual_desc}")
+    print("  Cookie: 不使用（公开内容）")
+    print(f"  输出: {OUTPUT_DIR}")
+    if ask("\n开始下载?（回车=是，输入 n=取消）: ", "y").strip().lower() in ("n", "no", "0"):
+        print("👋 已取消，什么也没下载。")
+        return
+
+    ok, fail = [], []
+    total = len(ids)
+    for i, vid in enumerate(ids, 1):
+        url = bilibili_url(vid)
+        print("\n" + "=" * 54)
+        print(f"⬇️  [{i}/{total}] {vid}")
+        print(f"   {url}")
+        print("=" * 54)
+        try:
+            ret = download(
+                url, is_playlist=False, sub_mode=sub_mode, langs=langs,
+                quality=quality, media_type=media_type, items=None,
+                ytdlp_opts=NO_COOKIE_OPTS,
+            )
+            if ret == 0:
+                ok.append(vid)
+            else:
+                fail.append((vid, f"退出码 {ret}"))
+                print(f"  ⚠️ 失败，跳过: {vid}（退出码 {ret}）")
+        except Exception as e:
+            fail.append((vid, str(e)))
+            print(f"  ⚠️ 失败，跳过: {vid}（{e}）")
+
+    print("\n" + "=" * 54)
+    print("📊 批量结果汇总")
+    print("=" * 54)
+    print(f"  成功: {len(ok)} / {total}")
+    print(f"  失败: {len(fail)} / {total}")
+    if fail:
+        print("  失败列表:")
+        for vid, reason in fail:
+            print(f"    - {vid}: {reason}")
+    sys.exit(0 if not fail else 1)
+
+
 # ---------- 主流程 ----------
 
-def main():
-    print("=" * 54)
-    print("🎬  交互式 YouTube 下载器（不用记参数）")
-    print("=" * 54)
-
+def main_youtube():
+    """现有 YouTube 单链 / 播放列表流程。"""
     if len(sys.argv) > 1:
         url = normalize_url(sys.argv[1])
         print(f"链接: {url}")
@@ -622,6 +779,20 @@ def main():
                           items=items))
     else:
         print("👋 已取消，什么也没下载。")
+
+
+def main():
+    print("=" * 54)
+    print("🎬  交互式下载器（不用记参数）")
+    print("=" * 54)
+    mode = ask_choice("请选择模式", [
+        ("youtube", "下载 YouTube（链接 / 播放列表）"),
+        ("bilibili", "通过文件下载 B 站视频"),
+    ], default=0)
+    if mode == "bilibili":
+        run_bilibili_batch()
+    else:
+        main_youtube()
 
 
 if __name__ == "__main__":
